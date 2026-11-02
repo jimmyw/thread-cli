@@ -1,0 +1,104 @@
+# thread-cli
+
+An interactive terminal sniffer for a Thread network, in the style of `mdns-cli`. It drives an
+OpenThread RCP (e.g. an ESP32-C6 running `ot_rcp`) over spinel as a promiscuous 802.15.4 radio,
+decrypts MAC and MLE traffic with the network key, and lists every device it hears with its
+RSSI, role, RLOC16, routes, children and IPv6 addresses.
+
+```
+thread-cli  3 thread devices  ch 25  PAN 0x1234  MyHome  443 frames, 44 decrypted  sort:rloc      key seq 4
+leader router 19, partition 0x1a2b3c4d  mesh-local fd11:2233:4455:6677::/64
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+▾ 9a3c51e2d07b44f1  0x4c00  leader        -84 dBm ▃▃▃▃▄▄▃▃▄▄▄▃    186 fr    2s
+      role          leader
+      rloc16        0x4c00  router id 19
+      rssi          last -84  avg -87.2  min -102  max -80  dBm over 186 frames  ▃▃▃▃▄▃▃▃▄▄▄▄
+      mle           Advertisement ×67, Discovery Request ×1; last Advertisement 2s ago
+      leader data   partition 0x1a2b3c4d, weighting 65, data version 168/239, leader router 19
+      routes        router 19 0x4c00  (self)
+      children      0x4c12  sleepy child  -102 dBm
+                    0x4c70  sleepy child  -84 dBm
+▸ (ext unknown)     0x4c70  sleepy child  -84 dBm ▄▃▃▃▃▃▃▃▃▃▃▃     98 fr    1s
+```
+
+## Run
+
+Needs Python ≥ 3.10 with `pyserial` and `cryptography` (both packaged by most distros), and a radio
+flashed with the ESP-IDF `ot_rcp` example built for spinel over USB (`sdkconfig.ci.rcp_usb`).
+
+```sh
+thread-cli --key 00112233445566778899aabbccddeeff -c 25
+thread-cli --dataset 0e080000000000010000000300001935060004001fffe0...   # key, channel, PAN, prefix, name
+thread-cli --key-file ~/.config/thread-logger/networkkey -c 25 -w capture.pcap
+thread-cli --dataset ... --replay capture.pcap          # offline, from a pcap (TAP or WITHFCS)
+thread-cli --dataset ... --json -t 60 | jq '.devices[] | {ext, rloc16, role, rssi}'
+```
+
+The port defaults to the only `/dev/serial/by-id/usb-Espressif_USB_JTAG*` device; pass `-u` when
+there is more than one. Without a key, frames are still listed (with RSSI) but not decrypted.
+`THREAD_NETWORK_KEY` in the environment is used if no key option is given.
+
+`-w FILE` saves everything to a pcap with 802.15.4 TAP headers (RSSI, LQI, channel), which Wireshark
+opens directly; add the key under IEEE 802.15.4 → Decryption Keys with "Thread hash".
+
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` / `k` `j` | move |
+| `PgUp` `PgDn`, `Home` `End` / `g` `G` | page, first, last |
+| `Enter`, `Space` | fold open or closed |
+| `→` / `l` | fold open, then step through the values on the row |
+| `←` / `h` | step back, then fold closed or jump to the parent |
+| `e` / `E` | expand all / collapse all |
+| `p` | ping the device, or the address picked with right/left; again to stop |
+| `c` | copy the value under the cursor (OSC 52, plus wl-copy / xclip / xsel) |
+| `s` | cycle sort: rloc, rssi, last seen, frames, name |
+| `/` | filter |
+| `a` | show / hide devices on other PANs (Zigbee etc. on the same channel) |
+| `[` `]` | previous / next channel |
+| `Esc` | clear the filter, then quit |
+| `?` | key list |
+| `q` | quit |
+
+## Ping
+
+Ping runs from this host, not from the radio (the RCP is a passive sniffer), using an unprivileged
+ICMPv6 socket, one probe a second with a 12 s timeout for sleepy children. Only addresses routed
+off-mesh are reachable: OMR addresses (`fdxx::/64` advertised by the border router, which the host
+learns via RA). The mesh-local addresses (ML-EID, RLOC) and link-local addresses are listed but
+reachable only from inside the mesh.
+
+OMR addresses are learned from the air: from a child's Address Registration TLV (MLE Child ID /
+Child Update Request), and from the source address of traffic a device originates.
+
+## How it works
+
+- `spinel.py`: HDLC-lite framing and the four property sets that turn an RCP into a sniffer
+  (`PHY_ENABLED`, `MAC_FILTER_MODE=monitor`, `PHY_CHAN`, `MAC_RAW_STREAM_ENABLED`); received frames
+  arrive as `STREAM_RAW` with RSSI/LQI metadata.
+- `crypto.py`: Thread key derivation (HMAC-SHA256(network key, key sequence ‖ "Thread") → MLE key ‖
+  MAC key) and AES-CCM* with the 13-byte nonce (source ext address ‖ frame counter ‖ level).
+- `wpan.py`: 802.15.4 frame parsing (2006 and 2015 frame versions, aux security header, IEs).
+- `lowpan.py`: 6LoWPAN mesh/fragment headers, IPHC + NHC (UDP, extension headers, IPv6-in-IPv6) and
+  reassembly, producing plain IPv6 packets.
+- `mle.py`: MLE decryption (AAD = IPv6 source ‖ destination ‖ aux header) and TLV parsing: Source
+  Address, Mode, Leader Data, Route64, Connectivity, Address16, Address Registration, Network Data,
+  Version, Timeout, datasets.
+- `store.py`: per-device state. Devices are keyed by extended address. A frame with only a short
+  source address is decrypted by trying each known device's extended address as the nonce source;
+  the one whose MIC verifies identifies the sender. Immediate acks (no source address) are credited
+  to the destination of the frame they acknowledge, which gives RSSI for one-way talkers too.
+
+A sleepy child shows as `(ext unknown)` until it sends an MLE message (Child Update Request or Child
+ID Request); until then its data polls can be counted and measured but not decrypted.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The tests build encrypted MLE and MAC frames from scratch and check the decoder: advertisement
+parsing, wrong-key rejection, short-address resolution by trial decryption, ack attribution and
+address learning.
