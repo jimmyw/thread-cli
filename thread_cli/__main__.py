@@ -8,6 +8,7 @@ import sys
 import time
 
 from . import crypto, pcap
+from .config import Config, default_key_file
 from .dataset import parse_dataset
 from .store import Store
 
@@ -36,12 +37,13 @@ def parse_args(argv=None):
         description="Interactive Thread (802.15.4) sniffer: lists devices with RSSI, role and addresses, "
                     "decrypting with the network key. Talks spinel to an OpenThread RCP.")
     ap.add_argument("-k", "--key", help="Thread network key (32 hex digits)")
-    ap.add_argument("--key-file", help="file holding the network key")
+    ap.add_argument("--key-file", help="file holding the network key (default: ~/.config/thread-cli/networkkey "
+                                       "or ~/.config/thread-logger/networkkey, if present)")
     ap.add_argument("-d", "--dataset", help="active operational dataset TLVs in hex (gives key, channel, "
                                             "PAN, mesh-local prefix and name)")
-    ap.add_argument("-c", "--channel", type=int, help="802.15.4 channel 11-26 (default: dataset, else 11)")
-    ap.add_argument("-u", "--port", help="RCP serial port (default: the only Espressif USB-JTAG device)")
-    ap.add_argument("--pan", help="Thread PAN ID, e.g. 0x1234 (default: dataset, else learned)")
+    ap.add_argument("-c", "--channel", type=int, help="802.15.4 channel 11-26 (default: dataset, config, else 11)")
+    ap.add_argument("-u", "--port", help="RCP serial port (default: config, else the only Espressif USB-JTAG device)")
+    ap.add_argument("--pan", help="Thread PAN ID, e.g. 0x1234 (default: dataset, config, else learned)")
     ap.add_argument("--mesh-local-prefix", help="mesh-local prefix, e.g. fd11:2233:4455:6677::")
     ap.add_argument("--key-seq", type=int, default=0, help="initial key sequence (default 0, learned from MLE)")
     ap.add_argument("--no-reset", action="store_true", help="don't reset the RCP at start")
@@ -52,6 +54,11 @@ def parse_args(argv=None):
     ap.add_argument("--json", action="store_true", help="no UI: capture (default 30 s), print JSON")
     ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     a = ap.parse_args(argv)
+    a.config = cfg = Config()
+    if cfg.error:
+        ap.error(f"config: {cfg.error}")
+    if a.port is None:
+        a.port = cfg.get("port")
 
     a.ds = parse_dataset(_hex(a.dataset)) if a.dataset else {}
     key = None
@@ -63,14 +70,19 @@ def parse_args(argv=None):
         key = a.ds["network_key"]
     elif os.environ.get("THREAD_NETWORK_KEY"):
         key = _hex(os.environ["THREAD_NETWORK_KEY"])
+    elif default_key_file():
+        a.key_file = default_key_file()
+        key = _hex(open(a.key_file).read())
     if key is not None and len(key) != 16:
         ap.error("network key must be 16 bytes (32 hex digits)")
     a.key_bytes = key
     if a.channel is None:
-        a.channel = a.ds.get("channel", 11)
+        a.channel = a.ds.get("channel") or cfg.get("channel") or 11
     if not 11 <= a.channel <= 26:
         ap.error("channel must be 11-26")
-    a.pan_id = int(a.pan, 0) if a.pan else a.ds.get("pan")
+    cpan = cfg.get("pan")
+    a.pan_id = (int(a.pan, 0) if a.pan else a.ds.get("pan") if a.ds.get("pan") is not None
+                else int(cpan, 0) if isinstance(cpan, str) else cpan)
     a.mlp = None
     if a.mesh_local_prefix:
         import ipaddress
@@ -134,7 +146,8 @@ class Capture:
             self.writer.close()
 
 
-def to_json(store: Store):
+def to_json(store: Store, names=None):
+    names = names or {}
     devs = []
     for d in sorted(store.devices.values(), key=lambda d: (not d.thread, d.rloc16 or 0xFFFF)):
         devs.append({
@@ -142,6 +155,7 @@ def to_json(store: Store):
             "rloc16": f"0x{d.rloc16:04x}" if d.rloc16 is not None else None,
             "pan": f"0x{d.pan:04x}" if d.pan is not None else None,
             "thread": d.thread,
+            "name": names.get(d.ext.hex(), "") if d.ext else "",
             "role": store.role(d),
             "mode": d.mode,
             "version": d.version,
@@ -183,7 +197,7 @@ def main(argv=None):
             cap.drain(10 ** 9)
             if cap.error:
                 print(f"source error: {cap.error}", file=sys.stderr)
-            json.dump(to_json(cap.store), sys.stdout, indent=2, default=str)
+            json.dump(to_json(cap.store, a.config.names), sys.stdout, indent=2, default=str)
             print()
             return 0
         from .ui import run_ui

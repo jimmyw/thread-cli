@@ -146,5 +146,24 @@ class Parsing(unittest.TestCase):
         self.assertEqual((f.ftype, f.seq), (wpan.FT_ACK, 7))
 
 
+class ConfigFile(unittest.TestCase):
+    def test_names_roundtrip_keeps_other_keys(self):
+        import json
+        import tempfile
+        from thread_cli.config import Config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "thread-cli", "config.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as f:
+                json.dump({"port": "/dev/ttyACM9", "pan": "0x1234"}, f)
+            c = Config(path)
+            c.set_name(ROUTER_EXT, "  köksbänk ")
+            self.assertEqual(Config(path).name(ROUTER_EXT), "köksbänk")
+            self.assertEqual(Config(path).get("port"), "/dev/ttyACM9")
+            c.set_name(ROUTER_EXT, "")
+            self.assertEqual(Config(path).name(ROUTER_EXT), "")
+            self.assertEqual(Config(path).get("pan"), "0x1234")
+
+
 if __name__ == "__main__":
     unittest.main()

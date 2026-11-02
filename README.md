@@ -36,7 +36,31 @@ thread-cli --dataset ... --json -t 60 | jq '.devices[] | {ext, rloc16, role, rss
 
 The port defaults to the only `/dev/serial/by-id/usb-Espressif_USB_JTAG*` device; pass `-u` when
 there is more than one. Without a key, frames are still listed (with RSSI) but not decrypted.
-`THREAD_NETWORK_KEY` in the environment is used if no key option is given.
+
+The network key comes from, in order: `--key`, `--key-file`, `--dataset`, `$THREAD_NETWORK_KEY`,
+then `~/.config/thread-cli/networkkey` or `~/.config/thread-logger/networkkey` if one exists (keep
+it `chmod 600`). So with a key file and a config file, plain `thread-cli` is enough.
+
+## Config
+
+`~/.config/thread-cli/config.json` (or `$XDG_CONFIG_HOME/thread-cli/config.json`) holds defaults for
+the options and the device names given with `N`:
+
+```json
+{
+  "port": "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:XX-if00",
+  "pan": "0x1234",
+  "channel": 25,
+  "names": {
+    "9a3c51e2d07b44f1": "kitchen sensor"
+  }
+}
+```
+
+Command-line options win over the dataset, which wins over the config. Names are keyed by
+extended address, the only identifier that survives a reattach (RLOC16s change), so a device can be
+named once its ext address is known. They show in the device list, in parent/route/child lines,
+in the filter and the `name` sort, and in `--json` output.
 
 `-w FILE` saves everything to a pcap with 802.15.4 TAP headers (RSSI, LQI, channel), which Wireshark
 opens directly; add the key under IEEE 802.15.4 → Decryption Keys with "Thread hash".
@@ -53,6 +77,7 @@ opens directly; add the key under IEEE 802.15.4 → Decryption Keys with "Thread
 | `e` / `E` | expand all / collapse all |
 | `p` | ping the device, or the address picked with right/left; again to stop |
 | `c` | copy the value under the cursor (OSC 52, plus wl-copy / xclip / xsel) |
+| `N` | name the device (Enter saves, Esc cancels, Ctrl-U clears; an empty name removes it) |
 | `s` | cycle sort: rloc, rssi, last seen, frames, name |
 | `/` | filter |
 | `a` | show / hide devices on other PANs (Zigbee etc. on the same channel) |

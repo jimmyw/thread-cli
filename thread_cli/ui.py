@@ -4,6 +4,7 @@ import ipaddress
 import time
 
 from . import clip, mle
+from .config import Config
 from .ping import Ping
 
 SPARK = "▁▂▃▄▅▆▇█"
@@ -18,6 +19,7 @@ HELP = [
     ("e / E", "expand all / collapse all"),
     ("p", "ping the device (or the picked address); again to stop"),
     ("c", "copy the value under the cursor"),
+    ("N", "name the device (saved by ext address; empty name removes it)"),
     ("s", "cycle sort: " + ", ".join(SORTS)),
     ("/", "filter (ext, rloc16, role, addresses, last frame)"),
     ("a", "show / hide devices from other PANs (Zigbee etc.)"),
@@ -152,6 +154,13 @@ class UI:
         self.msg = ""
         self.msg_t = 0
         self.rows = []
+        self.config = getattr(args, "config", None) or Config()
+        self.naming = None            # (device key, text being typed) while the N prompt is open
+        if self.config.error:
+            self.flash(f"config: {self.config.error}")
+
+    def label(self, d):
+        return self.config.name(d.ext)
 
     # ---- model -> rows -------------------------------------------------------------------------
     def visible_devices(self):
@@ -173,19 +182,20 @@ class UI:
         elif key == "frames":
             out.sort(key=lambda d: -d.frames)
         else:
-            out.sort(key=lambda d: d.name)
+            out.sort(key=lambda d: (not self.label(d), self.label(d).lower(), d.name))
         return out
 
     def _matches(self, d):
         f = self.filter.lower()
-        hay = [d.name, f"0x{d.rloc16:04x}" if d.rloc16 is not None else "", self.store.role(d),
+        hay = [d.name, self.label(d), f"0x{d.rloc16:04x}" if d.rloc16 is not None else "", self.store.role(d),
                d.last_frame] + list(d.addresses)
         return any(f in h.lower() for h in hay)
 
     def build(self, now):
         rows = []
-        st = self.store
-        for d in self.visible_devices():
+        devs = self.visible_devices()
+        self.name_w = min(24, max([len(self.label(d)) for d in devs] + [0]))
+        for d in devs:
             rows.append(self.dev_row(d, now))
             if d.key in self.expanded:
                 rows += self.detail_rows(d, now)
@@ -201,6 +211,10 @@ class UI:
                   curses.A_BOLD if d.thread and not stale else 0, value=d.ext.hex())
         else:
             r.add(f"{'(ext unknown)':<16}", "grey")
+        if self.name_w:
+            nm = self.label(d)
+            r.add("  ")
+            r.add(f"{nm[:self.name_w]:<{self.name_w}}", "white", curses.A_BOLD, value=nm or None)
         r.add("  ")
         if d.rloc16 is not None:
             r.add(f"0x{d.rloc16:04x}", "cyan", value=f"0x{d.rloc16:04x}")
@@ -231,6 +245,11 @@ class UI:
         r.addr = addrs[0][0] if addrs else None
         return r
 
+    def add_name(self, r, d):
+        nm = self.label(d)
+        if nm:
+            r.add("  ").add(nm, "white", curses.A_BOLD, value=nm)
+
     def kv(self, d, rid, key, value=None, color="default", pick=None):
         r = Row(d.key, rid)
         r.add("      ")
@@ -242,6 +261,8 @@ class UI:
     def detail_rows(self, d, now):
         st = self.store
         rows = []
+        if self.label(d):
+            rows.append(self.kv(d, "name", "name", self.label(d), "white", self.label(d)))
         role = st.role(d)
         r = self.kv(d, "role", "role", role or "-", ROLE_COLORS.get(role, "default"))
         par = st.parent_of(d)
@@ -249,6 +270,7 @@ class UI:
             r.add(", parent ", "default").add(f"0x{par.rloc16:04x}", "cyan", value=f"0x{par.rloc16:04x}")
             if par.ext:
                 r.add(" (").add(par.ext.hex(), "white", value=par.ext.hex()).add(")")
+            self.add_name(r, par)
         rows.append(r)
         if d.ext:
             rows.append(self.kv(d, "ext", "ext address", d.ext.hex(), "white", d.ext.hex()))
@@ -326,6 +348,7 @@ class UI:
                     r.add(f"  cost {rt['cost'] or '∞'}")
                 if peer and peer.ext:
                     r.add("  ").add(peer.ext.hex(), "white", value=peer.ext.hex())
+                    self.add_name(r, peer)
                 rows.append(r)
         if d.connectivity:
             c = d.connectivity
@@ -337,7 +360,8 @@ class UI:
             r.add(f"0x{ch.rloc16:04x}", "cyan", value=f"0x{ch.rloc16:04x}")
             r.add(f"  {st.role(ch):<13}", ROLE_COLORS.get(st.role(ch), "default"))
             if ch.ext:
-                r.add(ch.ext.hex(), "white", value=ch.ext.hex())
+                r.add(" ").add(ch.ext.hex(), "white", value=ch.ext.hex())
+                self.add_name(r, ch)
             if ch.rssi_last is not None:
                 r.add(f"  {ch.rssi_last} dBm", rssi_color(ch.rssi_last))
             rows.append(r)
@@ -451,10 +475,14 @@ class UI:
                    "no matches" if self.filter else "only devices from other PANs so far (a to show)")
             self.put(body_top + 1, 4, msg, self.c("grey"))
 
-        if self.msg and now - self.msg_t < 4:
+        if self.naming:
+            dev = self.store.devices.get(self.naming[0])
+            x = self.put(h - 1, 0, f"name {dev.ext.hex() if dev and dev.ext else ''}: ", self.c("yellow"))
+            self.put(h - 1, x, self.naming[1] + "▏", self.c("white", extra=curses.A_BOLD))
+        elif self.msg and now - self.msg_t < 4:
             self.put(h - 1, 0, self.msg, self.c("yellow"))
         else:
-            self.put(h - 1, 0, "Enter fold  ←→ pick  c copy  p ping  s sort  / filter  a all PANs  "
+            self.put(h - 1, 0, "Enter fold  ←→ pick  c copy  p ping  N name  s sort  / filter  a all PANs  "
                                "[ ] channel  ? help  q quit", self.c("grey"))
         scr.noutrefresh()
         if self.help:
@@ -567,6 +595,27 @@ class UI:
         if self.help:
             self.help = False
             return True
+        if self.naming:
+            key, text = self.naming
+            if ch in (10, 13, curses.KEY_ENTER):
+                self.naming = None
+                d = self.store.devices.get(key)
+                if d and d.ext:
+                    try:
+                        self.config.set_name(d.ext, text)
+                        self.flash(f"named {d.ext.hex()} {text.strip()!r}" if text.strip()
+                                   else f"removed the name of {d.ext.hex()}")
+                    except OSError as e:
+                        self.flash(f"can't save the name: {e}")
+            elif ch == 27:
+                self.naming = None
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.naming = (key, text[:-1])
+            elif ch == 21:                               # Ctrl-U clears
+                self.naming = (key, "")
+            elif isinstance(ch, str):
+                self.naming = (key, text + ch)
+            return True
         if self.filtering:
             if ch in (10, 13, curses.KEY_ENTER):
                 self.filtering = False
@@ -627,6 +676,12 @@ class UI:
             self.do_ping()
         elif ch == ord("c"):
             self.do_copy()
+        elif ch == ord("N") and row:
+            d = self.store.devices.get(row.dev)
+            if d is None or d.ext is None:
+                self.flash("can't name it yet: its ext address is unknown (RLOC16s change on reattach)")
+            else:
+                self.naming = (d.key, self.label(d))
         elif ch == ord("s"):
             self.sort = (self.sort + 1) % len(SORTS)
             self.flash(f"sort: {SORTS[self.sort]}")
@@ -666,7 +721,12 @@ class UI:
             if now - last_draw >= 0.25:
                 self.draw(now)
                 last_draw = now
-            ch = self.scr.getch()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                ch = -1
+            if isinstance(ch, str) and not (self.naming and ch.isprintable()):
+                ch = ord(ch)
             if ch == curses.KEY_RESIZE:
                 last_draw = 0
                 continue
@@ -684,4 +744,6 @@ class UI:
 
 
 def run_ui(cap, args):
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
     return curses.wrapper(lambda scr: UI(scr, cap, args).run())
