@@ -118,7 +118,26 @@ Child Update Request), and from the source address of traffic a device originate
   to the destination of the frame they acknowledge, which gives RSSI for one-way talkers too.
 
 A sleepy child shows as `(ext unknown)` until it sends an MLE message (Child Update Request or Child
-ID Request); until then its data polls can be counted and measured but not decrypted.
+ID Request); until then its data polls can be counted and measured but not decrypted. Sleepy children
+only send MLE when they attach or change addresses, which can be hours apart, so thread-cli remembers
+devices between runs (below).
+
+### Remembered devices
+
+Every device identified in a run (MAC/ext address, last RLOC16, mode, version, timeout, routable
+IPv6 addresses) is saved per PAN in `~/.config/thread-cli/devices.json`, every 30 s and on exit,
+replays included. In later runs those addresses are tried on encrypted frames from short addresses
+the decoder can't place yet (the one last seen on that RLOC16 first), so a child seen in any earlier
+run is identified by its first data poll; the MIC only verifies with the right address, so a stale
+entry never mislabels a device. Its remembered mode and addresses fill in right away (marked
+`remembered`), which gives ping targets before it sends anything. Entries not seen for 90 days are
+dropped; `--no-remember` neither reads nor writes the file.
+
+To learn from captures made by other tools, replay them oldest first:
+
+```sh
+for f in ~/thread-logs/*.pcap; do thread-cli --replay "$f" --json > /dev/null; done
+```
 
 ## Tests
 

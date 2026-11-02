@@ -129,6 +129,67 @@ class RoundTrip(unittest.TestCase):
         self.assertIn("UDP 5683->5683", d.last_frame)
 
 
+    def poll(self, short, parent, ext, fc):
+        hdr = bytearray(mac_header(short, parent, 3, True, fc=fc, ack=True))
+        hdr[0] = (hdr[0] & ~7) | 3            # command frame
+        ct, mic = crypto.ccm_encrypt(self.km.mac_key(0), crypto.nonce(ext, fc, 5), bytes(hdr), b"\x04")
+        return bytes(hdr) + ct + mic
+
+    def test_forwarded_source_address_stays_with_child(self):
+        self.advertisement(0x2C00)
+        st = self.st
+        child = st._by_ext(CHILD_EXT, PAN, 1000.0)
+        st.map_short(PAN, 0x2C05, CHILD_EXT)
+        router = st.devices[ROUTER_EXT.hex()]
+        omr = "fd00:aaaa:bbbb:1:1:2:3:4"
+        st.on_mesh.add(bytes.fromhex("fd00aaaabbbb0001"))
+        st._learn_address(child, lowpan.ipaddress.IPv6Address(omr).packed)    # child -> parent
+        st._learn_address(router, lowpan.ipaddress.IPv6Address(omr).packed)   # parent forwards
+        self.assertIn(omr, child.addresses)
+        self.assertNotIn(omr, router.addresses)
+        # seen at the router first (child's frame missed), then the child registers it
+        omr2 = "fd00:aaaa:bbbb:1:5:6:7:8"
+        st._learn_address(router, lowpan.ipaddress.IPv6Address(omr2).packed)
+        st._own(child, omr2, "registered")
+        self.assertEqual(child.addresses[omr2], "registered")
+        self.assertNotIn(omr2, router.addresses)
+
+    def test_remembered_child_identified_by_first_poll(self):
+        # A fresh run that never saw the child's MLE can't decrypt its polls...
+        self.feed(self.poll(0x2C05, 0x2C00, CHILD_EXT, 42))
+        self.assertNotIn(CHILD_EXT.hex(), self.st.devices)
+        # ...unless an earlier run remembered it.
+        st = Store(crypto.KeyManager(KEY), thread_pan=PAN, mesh_local_prefix=MLP)
+        st.remember({CHILD_EXT.hex(): {"rloc16": "0x2c05", "mode": 4, "last_seen": 500.0,
+                                       "addresses": ["fd00::1"]},
+                     "0102030405060708": {"rloc16": "0x2c01"}})
+        st.ingest(spinel.RxFrame(1000.0, self.poll(0x2C05, 0x2C00, CHILD_EXT, 43), -70, 200, 15))
+        child = st.devices[CHILD_EXT.hex()]
+        self.assertEqual((child.rloc16, child.mode, child.remembered), (0x2C05, 4, 500.0))
+        self.assertEqual(child.counts["poll"], 1)
+        self.assertEqual(child.addresses["fd00::1"], "remembered")
+        self.assertEqual(st.role(child), "sleepy child")
+        self.assertNotIn("0102030405060708", st.devices)
+        snap = st.snapshot()[CHILD_EXT.hex()]
+        self.assertEqual((snap["rloc16"], snap["mode"], snap["addresses"]), ("0x2c05", 4, ["fd00::1"]))
+
+    def test_memory_file_merge(self):
+        import tempfile
+        from thread_cli.config import DeviceMemory
+        with tempfile.TemporaryDirectory() as tmp:
+            m = DeviceMemory(os.path.join(tmp, "devices.json"))
+            m.save(PAN, {"aa": {"rloc16": "0x2c05", "mode": 4, "last_seen": 2000.0, "first_seen": 1000.0}})
+            # an older replay doesn't overwrite newer data, but extends first_seen
+            m.save(PAN, {"aa": {"rloc16": "0x2c09", "mode": None, "last_seen": 900.0, "first_seen": 800.0},
+                         "bb": {"rloc16": "0x2c00", "last_seen": 1500.0}})
+            got = m.load(PAN)
+            self.assertEqual(got["aa"]["rloc16"], "0x2c05")
+            self.assertEqual(got["aa"]["first_seen"], 800.0)
+            self.assertIn("bb", got)
+            self.assertEqual(m.load(0x9999), {})
+            self.assertEqual(os.stat(m.path).st_mode & 0o777, 0o600)
+
+
 class Parsing(unittest.TestCase):
     def test_hdlc_roundtrip(self):
         payload = bytes(range(256))

@@ -53,6 +53,7 @@ class Device:
     mle_fc: int | None = None
     key_seq: int | None = None
     channel: int | None = None
+    remembered: float | None = None  # last_seen from an earlier run, if it was remembered
     last_frame: str = ""
     ping: object = None
 
@@ -123,6 +124,8 @@ class Store:
         self.leader = None                                  # latest Leader Data seen
         self.devices: dict[str, Device] = {}
         self.short2key = {}                                 # (pan, short) -> device key
+        self.remembered = {}                                # ext hex -> entry from earlier runs
+        self.addr_owner = {}                                # ip str -> device key
         self.stats = Stats()
         self.reasm = lowpan.Reassembler()
         self._ack = None                                    # (seq, dst key, time)
@@ -134,9 +137,46 @@ class Store:
         d = self.devices.get(k)
         if d is None:
             d = self.devices[k] = Device(key=k, ext=ext, pan=pan, first=now)
+            self._restore(d)
         if pan is not None and d.pan is None:
             d.pan = pan
         return d
+
+    def _restore(self, d: Device):
+        """Fill in what an earlier run learned about this device (mode, version, addresses)."""
+        m = self.remembered.get(d.key)
+        if not m:
+            return
+        d.remembered = m.get("last_seen")
+        for f in ("mode", "version", "timeout"):
+            if getattr(d, f) is None and isinstance(m.get(f), int):
+                setattr(d, f, m[f])
+        for a in m.get("addresses", []):
+            if a not in self.addr_owner or self.addr_owner[a] not in self.devices:
+                d.addresses.setdefault(a, "remembered")
+                self.addr_owner[a] = d.key
+
+    def remember(self, entries: dict):
+        self.remembered = entries
+        for d in self.devices.values():
+            if d.ext and d.remembered is None:
+                self._restore(d)
+
+    def snapshot(self) -> dict:
+        """ext hex -> entry, for the devices of the Thread network identified in this run."""
+        out = {}
+        for d in self.devices.values():
+            if not d.ext or not d.thread or (self.thread_pan is not None and d.pan != self.thread_pan):
+                continue
+            out[d.key] = {
+                "rloc16": f"0x{d.rloc16:04x}" if d.rloc16 is not None else None,
+                "mode": d.mode, "version": d.version, "timeout": d.timeout,
+                "addresses": [a for a, o in d.addresses.items()
+                              if not a.startswith("fe80:") and o != "remembered"]
+                             or self.remembered.get(d.key, {}).get("addresses", []),
+                "first_seen": round(d.first, 3), "last_seen": round(d.last, 3),
+            }
+        return out
 
     def _by_short(self, short: int, pan, now) -> Device:
         k = self.short2key.get((pan, short))
@@ -177,6 +217,9 @@ class Store:
             old = self.devices.get(old_key)
             if old is not None and old.ext is None:        # placeholder: fold it in
                 d.merge(old)
+                for ip in old.addresses:
+                    if self.addr_owner.get(ip) == old_key:
+                        self.addr_owner[ip] = d.key
                 if old.rloc16 is not None:
                     pass
                 del self.devices[old_key]
@@ -282,6 +325,12 @@ class Store:
             # Unknown short source: try every known Thread device on this PAN (there are few).
             cands += [d.ext for d in self.devices.values()
                       if d.ext and d.ext != src_ext and (d.thread or d.pan == pan)]
+            if self.remembered and pan == self.thread_pan:
+                # Devices from earlier runs not heard yet; the one last seen on this RLOC16 first.
+                short = f"0x{f.src:04x}" if isinstance(f.src, int) else None
+                rest = [k for k in self.remembered if k not in self.devices]
+                rest.sort(key=lambda k: self.remembered[k].get("rloc16") != short)
+                cands += [bytes.fromhex(k) for k in rest]
         for ext in cands:
             p = crypto.ccm_decrypt(key, crypto.nonce(ext, f.frame_counter, f.sec_level), aad,
                                    f.payload, f.mic, encrypted=f.sec_level >= 4)
@@ -348,8 +397,23 @@ class Store:
         if is_ml or prefix in self.on_mesh or is_child:
             if is_child and not is_ml:
                 self.on_mesh.add(prefix)
-            s = fmt_ip(a)
-            dev.addresses.setdefault(s, "seen")
+            self._own(dev, fmt_ip(a), "seen")
+
+    def _own(self, dev, ip: str, origin: str):
+        """Give `ip` to `dev`. An address can have one owner. A registered address always moves to
+        its registrant; one only seen as a packet source stays with whoever was seen sending it
+        first. That is the originator: a router forwarding a child's packet to a neighbour (no
+        mesh header when the neighbour is the destination) sends it after the child sent it to
+        the router."""
+        k = self.addr_owner.get(ip)
+        owner = self.devices.get(k) if k else None
+        if owner is not None and owner is not dev:
+            if origin != "registered" and owner.addresses.get(ip) not in (None, "remembered"):
+                return
+            owner.addresses.pop(ip, None)
+        self.addr_owner[ip] = dev.key
+        if origin == "registered" or dev.addresses.get(ip) in (None, "remembered"):
+            dev.addresses[ip] = origin
 
     def _handle_mle(self, pkt, dev, pan, now):
         m = mle.decrypt(pkt.payload, pkt.src, pkt.dst, self.km)
@@ -407,6 +471,10 @@ class Store:
                 if ds.get("network_name") and not self.network_name:
                     self.network_name = ds["network_name"]
         if isinstance(t.get(mle.T_ADDR_REG), list):
+            registrant = sender
+            if (m.command in (12, 14) and dst_ext and sender.rloc16 is not None
+                    and not sender.rloc16 & 0x1FF):
+                registrant = self._by_ext(dst_ext, pan, now)   # parent echoing its child's addresses
             for kind, cid, data in t[mle.T_ADDR_REG]:
                 if kind == "full":
                     a = data
@@ -418,7 +486,7 @@ class Store:
                     if cid != 0:
                         self.on_mesh.add(p)
                 if a[:8] != LL_PREFIX and not is_rloc_iid(a[8:]):
-                    sender.addresses[fmt_ip(a)] = "registered"
+                    self._own(registrant, fmt_ip(a), "registered")
 
     # ---- derived views -----------------------------------------------------------------------
     def role(self, d: Device) -> str:

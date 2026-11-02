@@ -342,6 +342,9 @@ class UI:
             rows.append(self.kv(d, "lqi", "link", ", ".join(parts)))
         r = self.kv(d, "seen", "seen", f"first {hms(d.first)}, last {hms(d.last)} ({ago(d.last, now)} ago)",
                     "amber" if now - d.last > STALE else "default")
+        if d.remembered:
+            r.add(f"  known since an earlier run (last {time.strftime('%Y-%m-%d %H:%M', time.localtime(d.remembered))})",
+                  "grey")
         if d.channel:
             r.add(f"  ch {d.channel}", "grey")
         if d.pan is not None:

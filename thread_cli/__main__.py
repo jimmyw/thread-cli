@@ -8,7 +8,7 @@ import sys
 import time
 
 from . import crypto, pcap
-from .config import Config, default_key_file
+from .config import Config, DeviceMemory, default_key_file
 from .dataset import parse_dataset
 from .store import Store
 
@@ -51,6 +51,9 @@ def parse_args(argv=None):
     ap.add_argument("-r", "--replay", help="read frames from a pcap instead of the radio")
     ap.add_argument("--realtime", action="store_true", help="with --replay: keep the original pacing")
     ap.add_argument("-t", "--timeout", type=float, help="stop after SEC seconds")
+    ap.add_argument("--no-remember", action="store_true",
+                    help="don't use or update the devices remembered from earlier runs "
+                         "(~/.config/thread-cli/devices.json)")
     ap.add_argument("--json", action="store_true", help="no UI: capture (default 30 s), print JSON")
     ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     a = ap.parse_args(argv)
@@ -111,7 +114,29 @@ class Capture:
             self.port = a.port or find_port()
             self.src = SpinelSniffer(self.port, a.channel, reset=not a.no_reset)
         self.channel = a.channel
+        self.memory = None if a.no_remember or self.store.km is None else DeviceMemory()
+        self.memory_pan = None
+        self.saved_at = time.time()
+        self._load_memory()
         self.src.start(self.q.put)
+
+    def _load_memory(self):
+        pan = self.store.thread_pan
+        if self.memory is None or pan is None or pan == self.memory_pan:
+            return
+        self.memory_pan = pan
+        self.store.remember(self.memory.load(pan))
+
+    def save_memory(self):
+        if self.memory is None or self.memory_pan is None:
+            return
+        snap = self.store.snapshot()
+        if snap:
+            try:
+                self.memory.save(self.memory_pan, snap)
+            except OSError as e:
+                self.memory.error = str(e)
+        self.saved_at = time.time()
 
     def drain(self, limit=5000):
         n = 0
@@ -126,6 +151,10 @@ class Capture:
                 self.channel = rx.channel
             self.store.ingest(rx)
             n += 1
+        if self.memory_pan != self.store.thread_pan:
+            self._load_memory()                     # PAN learned from the traffic
+        if time.time() - self.saved_at > 30:
+            self.save_memory()
         return n
 
     @property
@@ -142,6 +171,7 @@ class Capture:
 
     def close(self):
         self.src.stop()
+        self.save_memory()
         if self.writer:
             self.writer.close()
 
