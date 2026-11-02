@@ -19,7 +19,8 @@ HELP = [
     ("e / E", "expand all / collapse all"),
     ("p", "ping the device (or the picked address); again to stop"),
     ("c", "copy the value under the cursor"),
-    ("N", "name the device (saved by ext address; empty name removes it)"),
+    ("N", "name the device (saved by MAC/ext address; empty name removes it)"),
+    ("T", "tree view: children under their parent router (toggle)"),
     ("s", "cycle sort: " + ", ".join(SORTS)),
     ("/", "filter (ext, rloc16, role, addresses, last frame)"),
     ("a", "show / hide devices from other PANs (Zigbee etc.)"),
@@ -28,6 +29,11 @@ HELP = [
     ("?", "this help"),
     ("q", "quit"),
 ]
+
+
+def mac(ext: bytes) -> str:
+    """Extended (MAC) address as 36:65:e0:66:84:03:52:38."""
+    return ext.hex(":")
 
 
 def ago(t, now):
@@ -150,6 +156,7 @@ class UI:
         self.filter = ""
         self.filtering = False
         self.show_foreign = False
+        self.tree = False
         self.help = False
         self.msg = ""
         self.msg_t = 0
@@ -187,7 +194,8 @@ class UI:
 
     def _matches(self, d):
         f = self.filter.lower()
-        hay = [d.name, self.label(d), f"0x{d.rloc16:04x}" if d.rloc16 is not None else "", self.store.role(d),
+        hay = [d.name, mac(d.ext) if d.ext else "", self.label(d),
+               f"0x{d.rloc16:04x}" if d.rloc16 is not None else "", self.store.role(d),
                d.last_frame] + list(d.addresses)
         return any(f in h.lower() for h in hay)
 
@@ -195,22 +203,53 @@ class UI:
         rows = []
         devs = self.visible_devices()
         self.name_w = min(24, max([len(self.label(d)) for d in devs] + [0]))
+        if not self.tree:
+            for d in devs:
+                rows.append(self.dev_row(d, now))
+                if d.key in self.expanded:
+                    rows += self.detail_rows(d, now)
+            self.rows = rows
+            return
+        # tree: each child goes right after its parent (in the current sort order); a child whose
+        # parent isn't listed (not heard, filtered out) stays at the top level.
+        listed = {d.key for d in devs}
+        kids = {}
+        roots = []
         for d in devs:
-            rows.append(self.dev_row(d, now))
+            par = self.store.parent_of(d)
+            if par is not None and par.key in listed and par.key != d.key:
+                kids.setdefault(par.key, []).append(d)
+            else:
+                roots.append(d)
+        for d in roots:
+            rows.append(self.dev_row(d, now, tree=""))
             if d.key in self.expanded:
                 rows += self.detail_rows(d, now)
+            children = kids.get(d.key, [])
+            for i, c in enumerate(children):
+                last = i == len(children) - 1
+                rows.append(self.dev_row(c, now, tree=" └─" if last else " ├─"))
+                if c.key in self.expanded:
+                    guide = "   " if last else " │ "
+                    for r in self.detail_rows(c, now):
+                        r.segs.insert(0, (guide, "grey", 0, None))
+                        rows.append(r)
         self.rows = rows
 
-    def dev_row(self, d, now):
+    def dev_row(self, d, now, tree=None):
         st = self.store
         r = Row(d.key, "dev", is_dev=True)
+        if tree:
+            r.add(tree, "grey")
         r.add("▾ " if d.key in self.expanded else "▸ ", "grey")
         stale = now - d.last > STALE
         if d.ext:
-            r.add(f"{d.ext.hex():<16}", "amber" if stale else ("white" if d.thread else "grey"),
-                  curses.A_BOLD if d.thread and not stale else 0, value=d.ext.hex())
+            r.add(f"{mac(d.ext):<23}", "amber" if stale else ("white" if d.thread else "grey"),
+                  curses.A_BOLD if d.thread and not stale else 0, value=mac(d.ext))
         else:
-            r.add(f"{'(ext unknown)':<16}", "grey")
+            r.add(f"{'(ext unknown)':<23}", "grey")
+        if tree == "":
+            r.add("   ")
         if self.name_w:
             nm = self.label(d)
             r.add("  ")
@@ -269,13 +308,13 @@ class UI:
         if par:
             r.add(", parent ", "default").add(f"0x{par.rloc16:04x}", "cyan", value=f"0x{par.rloc16:04x}")
             if par.ext:
-                r.add(" (").add(par.ext.hex(), "white", value=par.ext.hex()).add(")")
+                r.add(" (").add(mac(par.ext), "white", value=mac(par.ext)).add(")")
             self.add_name(r, par)
         rows.append(r)
         if d.ext:
-            rows.append(self.kv(d, "ext", "ext address", d.ext.hex(), "white", d.ext.hex()))
+            rows.append(self.kv(d, "ext", "mac (ext)", mac(d.ext), "white", mac(d.ext)))
         else:
-            rows.append(self.kv(d, "ext", "ext address",
+            rows.append(self.kv(d, "ext", "mac (ext)",
                                 "unknown until it sends an MLE message; its frames can't be decrypted yet",
                                 "amber"))
         if d.rloc16 is not None:
@@ -347,7 +386,7 @@ class UI:
                     r.add(" out ").add(str(rt["lq_out"]), lq(rt["lq_out"]))
                     r.add(f"  cost {rt['cost'] or '∞'}")
                 if peer and peer.ext:
-                    r.add("  ").add(peer.ext.hex(), "white", value=peer.ext.hex())
+                    r.add("  ").add(mac(peer.ext), "white", value=mac(peer.ext))
                     self.add_name(r, peer)
                 rows.append(r)
         if d.connectivity:
@@ -360,7 +399,7 @@ class UI:
             r.add(f"0x{ch.rloc16:04x}", "cyan", value=f"0x{ch.rloc16:04x}")
             r.add(f"  {st.role(ch):<13}", ROLE_COLORS.get(st.role(ch), "default"))
             if ch.ext:
-                r.add(" ").add(ch.ext.hex(), "white", value=ch.ext.hex())
+                r.add(" ").add(mac(ch.ext), "white", value=mac(ch.ext))
                 self.add_name(r, ch)
             if ch.rssi_last is not None:
                 r.add(f"  {ch.rssi_last} dBm", rssi_color(ch.rssi_last))
@@ -477,12 +516,12 @@ class UI:
 
         if self.naming:
             dev = self.store.devices.get(self.naming[0])
-            x = self.put(h - 1, 0, f"name {dev.ext.hex() if dev and dev.ext else ''}: ", self.c("yellow"))
+            x = self.put(h - 1, 0, f"name {mac(dev.ext) if dev and dev.ext else ''}: ", self.c("yellow"))
             self.put(h - 1, x, self.naming[1] + "▏", self.c("white", extra=curses.A_BOLD))
         elif self.msg and now - self.msg_t < 4:
             self.put(h - 1, 0, self.msg, self.c("yellow"))
         else:
-            self.put(h - 1, 0, "Enter fold  ←→ pick  c copy  p ping  N name  s sort  / filter  a all PANs  "
+            self.put(h - 1, 0, "Enter fold  ←→ pick  c copy  p ping  N name  T tree  s sort  / filter  a all PANs  "
                                "[ ] channel  ? help  q quit", self.c("grey"))
         scr.noutrefresh()
         if self.help:
@@ -603,8 +642,8 @@ class UI:
                 if d and d.ext:
                     try:
                         self.config.set_name(d.ext, text)
-                        self.flash(f"named {d.ext.hex()} {text.strip()!r}" if text.strip()
-                                   else f"removed the name of {d.ext.hex()}")
+                        self.flash(f"named {mac(d.ext)} {text.strip()!r}" if text.strip()
+                                   else f"removed the name of {mac(d.ext)}")
                     except OSError as e:
                         self.flash(f"can't save the name: {e}")
             elif ch == 27:
@@ -679,9 +718,12 @@ class UI:
         elif ch == ord("N") and row:
             d = self.store.devices.get(row.dev)
             if d is None or d.ext is None:
-                self.flash("can't name it yet: its ext address is unknown (RLOC16s change on reattach)")
+                self.flash("can't name it yet: its MAC (ext) address is unknown (RLOC16s change on reattach)")
             else:
                 self.naming = (d.key, self.label(d))
+        elif ch == ord("T"):
+            self.tree = not self.tree
+            self.flash("tree view: children under their parent" if self.tree else "flat list")
         elif ch == ord("s"):
             self.sort = (self.sort + 1) % len(SORTS)
             self.flash(f"sort: {SORTS[self.sort]}")

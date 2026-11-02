@@ -152,6 +152,7 @@ def to_json(store: Store, names=None):
     for d in sorted(store.devices.values(), key=lambda d: (not d.thread, d.rloc16 or 0xFFFF)):
         devs.append({
             "ext": d.ext.hex() if d.ext else None,
+            "mac": d.ext.hex(":") if d.ext else None,
             "rloc16": f"0x{d.rloc16:04x}" if d.rloc16 is not None else None,
             "pan": f"0x{d.pan:04x}" if d.pan is not None else None,
             "thread": d.thread,

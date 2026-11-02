@@ -3,14 +3,15 @@
 An interactive terminal sniffer for a Thread network, in the style of `mdns-cli`. It drives an
 OpenThread RCP (e.g. an ESP32-C6 running `ot_rcp`) over spinel as a promiscuous 802.15.4 radio,
 decrypts MAC and MLE traffic with the network key, and lists every device it hears with its
-RSSI, role, RLOC16, routes, children and IPv6 addresses.
+MAC (extended) address, RSSI, role, RLOC16, routes, children and IPv6 addresses.
 
 ```
 thread-cli  3 thread devices  ch 25  PAN 0x1234  MyHome  443 frames, 44 decrypted  sort:rloc      key seq 4
 leader router 19, partition 0x1a2b3c4d  mesh-local fd11:2233:4455:6677::/64
 ────────────────────────────────────────────────────────────────────────────────────────────────────────
-▾ 9a3c51e2d07b44f1  0x4c00  leader        -84 dBm ▃▃▃▃▄▄▃▃▄▄▄▃    186 fr    2s
+▾ 9a:3c:51:e2:d0:7b:44:f1  0x4c00  leader        -84 dBm ▃▃▃▃▄▄▃▃▄▄▄▃    186 fr    2s
       role          leader
+      mac (ext)     9a:3c:51:e2:d0:7b:44:f1
       rloc16        0x4c00  router id 19
       rssi          last -84  avg -87.2  min -102  max -80  dBm over 186 frames  ▃▃▃▃▄▃▃▃▄▄▄▄
       mle           Advertisement ×67, Discovery Request ×1; last Advertisement 2s ago
@@ -18,7 +19,7 @@ leader router 19, partition 0x1a2b3c4d  mesh-local fd11:2233:4455:6677::/64
       routes        router 19 0x4c00  (self)
       children      0x4c12  sleepy child  -102 dBm
                     0x4c70  sleepy child  -84 dBm
-▸ (ext unknown)     0x4c70  sleepy child  -84 dBm ▄▃▃▃▃▃▃▃▃▃▃▃     98 fr    1s
+▸ (ext unknown)            0x4c70  sleepy child  -84 dBm ▄▃▃▃▃▃▃▃▃▃▃▃     98 fr    1s
 ```
 
 ## Run
@@ -78,6 +79,7 @@ opens directly; add the key under IEEE 802.15.4 → Decryption Keys with "Thread
 | `p` | ping the device, or the address picked with right/left; again to stop |
 | `c` | copy the value under the cursor (OSC 52, plus wl-copy / xclip / xsel) |
 | `N` | name the device (Enter saves, Esc cancels, Ctrl-U clears; an empty name removes it) |
+| `T` | tree view: children listed under their parent router (toggle) |
 | `s` | cycle sort: rloc, rssi, last seen, frames, name |
 | `/` | filter |
 | `a` | show / hide devices on other PANs (Zigbee etc. on the same channel) |
